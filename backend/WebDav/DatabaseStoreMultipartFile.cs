@@ -1,5 +1,4 @@
 ﻿using Microsoft.AspNetCore.Http;
-using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.Clients.Usenet;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database;
@@ -14,7 +13,8 @@ public class DatabaseStoreMultipartFile(
     HttpContext httpContext,
     DavDatabaseClient dbClient,
     UsenetStreamingClient usenetClient,
-    ConfigManager configManager
+    ConfigManager configManager,
+    ActiveStreamTracker activeStreamTracker
 ) : BaseStoreStreamFile(httpContext)
 {
     public DavItem DavItem => davMultipartFile;
@@ -29,20 +29,28 @@ public class DatabaseStoreMultipartFile(
         // store the DavItem being accessed in the http context
         httpContext.Items["DavItem"] = davMultipartFile;
 
+        // register active stream and deregister when the response completes
+        var streamInfo = activeStreamTracker.Register(davMultipartFile.Name);
+        httpContext.Items["ActiveStreamInfo"] = streamInfo;
+        if (streamInfo != null)
+        {
+            httpContext.Response.OnCompleted(() =>
+            {
+                activeStreamTracker.Deregister(streamInfo.Id);
+                return Task.CompletedTask;
+            });
+        }
+
+        // return the stream
         var id = davMultipartFile.Id;
         var multipartFile = await dbClient.GetDavMultipartFileAsync(davMultipartFile, ct).ConfigureAwait(false);
         if (multipartFile is null) throw new FileNotFoundException($"Could not find nzb file with id: {id}");
-        return GetStream(multipartFile);
-    }
-
-    private Stream GetStream(DavMultipartFile multipartFile)
-    {
         var packedStream = new DavMultipartFileStream(
             multipartFile.Metadata.FileParts,
             usenetClient,
-            configManager.GetArticleBufferSize()
+            configManager.GetArticleBufferSize(),
+            streamInfo
         );
-
         return multipartFile.Metadata.AesParams != null
             ? new AesDecoderStream(packedStream, multipartFile.Metadata.AesParams)
             : packedStream;

@@ -57,7 +57,7 @@ public class HealthCheckService : BackgroundService
                 }
 
                 // get concurrency
-                var concurrency = _configManager.GetUsenetProviderConfig().TotalPooledConnections;
+                var concurrency = _configManager.GetHealthCheckConcurrency();
                 using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
 
                 // get the davItem to health-check
@@ -85,7 +85,7 @@ public class HealthCheckService : BackgroundService
             }
             catch (Exception e)
             {
-                Log.Error(e, $"Unexpected error performing background health checks: {e.Message}");
+                Log.Error(e, "Unexpected error performing background health checks: {ErrorMessage}", e.Message);
                 await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken).ConfigureAwait(false);
             }
         }
@@ -94,7 +94,8 @@ public class HealthCheckService : BackgroundService
     public static IOrderedQueryable<DavItem> GetHealthCheckQueueItems(DavDatabaseClient dbClient)
     {
         return GetHealthCheckQueueItemsQuery(dbClient)
-            .OrderBy(x => x.NextHealthCheck)
+            .OrderBy(x => x.NextHealthCheck == null ? 1 : 0)
+            .ThenBy(x => x.NextHealthCheck)
             .ThenByDescending(x => x.ReleaseDate)
             .ThenBy(x => x.Id);
     }
@@ -130,9 +131,12 @@ public class HealthCheckService : BackgroundService
                 debounce(() => _websocketManager.SendMessage(WebsocketTopic.HealthItemProgress, message));
             };
 
+            // sample segments for large files to avoid overwhelming NNTP providers
+            var sampled = SampleSegments(segments);
+
             // perform health check
-            var progress = progressHook.ToPercentage(segments.Count);
-            await _usenetClient.CheckAllSegmentsAsync(segments, concurrency, progress, ct).ConfigureAwait(false);
+            var progress = progressHook.ToPercentage(sampled.Count);
+            await _usenetClient.CheckAllSegmentsAsync(sampled, concurrency, progress, ct).ConfigureAwait(false);
             _ = _websocketManager.SendMessage(WebsocketTopic.HealthItemProgress, $"{davItem.Id}|100");
             _ = _websocketManager.SendMessage(WebsocketTopic.HealthItemProgress, $"{davItem.Id}|done");
 
@@ -162,6 +166,42 @@ public class HealthCheckService : BackgroundService
             // when usenet article is missing, perform repairs
             await Repair(davItem, dbClient, ct).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// For files with more than 4000 segments, returns a stratified sample:
+    /// - First 100 segments (head)
+    /// - Last 100 segments (tail)
+    /// - ~4000 evenly-spaced segments from the middle
+    /// This reduces checks from tens of thousands to ~4200 while maintaining
+    /// even coverage across the entire file.
+    /// </summary>
+    public static List<string> SampleSegments(List<string> segments)
+    {
+        const int threshold = 4000;
+        if (segments.Count <= threshold) return segments;
+
+        const int headCount = 100;
+        const int tailCount = 100;
+        const int strideTarget = 4000;
+
+        var result = new HashSet<int>();
+
+        // head
+        for (var i = 0; i < Math.Min(headCount, segments.Count); i++)
+            result.Add(i);
+
+        // tail
+        for (var i = Math.Max(0, segments.Count - tailCount); i < segments.Count; i++)
+            result.Add(i);
+
+        // evenly-spaced stride through the middle
+        var stride = Math.Max(1, segments.Count / strideTarget);
+        for (var i = 0; i < segments.Count; i += stride)
+            result.Add(i);
+
+        // return in original order
+        return result.OrderBy(i => i).Select(i => segments[i]).ToList();
     }
 
     private async Task UpdateReleaseDate(DavItem davItem, List<string> segments, CancellationToken ct)

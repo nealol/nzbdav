@@ -154,12 +154,36 @@ public class ConfigManager
         return new SemaphorePriorityOdds() { HighPriorityOdds = numericalValue };
     }
 
+    public int GetHealthCheckConcurrency()
+    {
+        return int.Parse(
+            StringUtil.EmptyToNull(GetConfigValue("repair.healthcheck-concurrency"))
+            ?? "50"
+        );
+    }
+
     public bool IsEnforceReadonlyWebdavEnabled()
     {
         var defaultValue = true;
         var configValue = StringUtil.EmptyToNull(GetConfigValue("webdav.enforce-readonly"));
         return (configValue != null ? bool.Parse(configValue) : defaultValue);
     }
+
+    public bool IsActiveStreamTrackerEnabled()
+    {
+        var configValue = StringUtil.EmptyToNull(GetConfigValue("webdav.active-stream-tracker"));
+        return configValue == null || !bool.TryParse(configValue, out var result) || result;
+    }
+
+    public bool IsArticleCacheEnabled()
+        => GetConfigValue<bool?>("usenet.article-cache-enabled") ?? false;
+
+    public int GetArticleCacheMaxSizeGb()
+        => GetConfigValue<int?>("usenet.article-cache-max-size-gb") ?? 0;
+
+    public string GetArticleCacheDir()
+        => StringUtil.EmptyToNull(GetConfigValue("usenet.article-cache-dir"))
+           ?? Path.Combine(DavDatabaseContext.ConfigPath, "article-cache");
 
     public HashSet<string> GetEnsureArticleExistenceCategories()
     {

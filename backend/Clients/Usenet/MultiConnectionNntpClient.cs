@@ -1,4 +1,5 @@
-﻿using System.Diagnostics.CodeAnalysis;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using NzbWebDAV.Clients.Usenet.Concurrency;
 using NzbWebDAV.Clients.Usenet.Connections;
 using NzbWebDAV.Clients.Usenet.Models;
@@ -21,21 +22,38 @@ namespace NzbWebDAV.Clients.Usenet;
 /// <param name="connectionPool"></param>
 /// <param name="type"></param>
 /// <param name="circuitBreaker"></param>
-/// <param name="providerName"></param>
 [SuppressMessage("ReSharper", "AccessToDisposedClosure")]
 public class MultiConnectionNntpClient(
     ConnectionPool<INntpClient> connectionPool,
     ProviderType type,
-    ProviderCircuitBreaker circuitBreaker,
-    string providerName
+    string providerName,
+    ProviderCircuitBreaker circuitBreaker
 ) : NntpClient
 {
     public ProviderType ProviderType { get; } = type;
+    public string ProviderName { get; } = providerName;
     public bool IsTripped => circuitBreaker.IsTripped;
     public int LiveConnections => connectionPool.LiveConnections;
     public int IdleConnections => connectionPool.IdleConnections;
     public int ActiveConnections => connectionPool.ActiveConnections;
     public int AvailableConnections => connectionPool.AvailableConnections;
+
+    private static readonly ConcurrentDictionary<string, int> TimeoutCounts = new();
+    private static readonly Timer TimeoutAggregationTimer = new(_ =>
+    {
+        foreach (var key in TimeoutCounts.Keys)
+        {
+            if (TimeoutCounts.TryRemove(key, out var count) && count > 0)
+            {
+                Log.Warning("[{ProviderName}] {Count} NNTP timeouts in the last 60 seconds", key, count);
+            }
+        }
+    }, null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
+
+    private static void IncrementTimeoutCount(string provider)
+    {
+        TimeoutCounts.AddOrUpdate(provider, 1, (_, existing) => existing + 1);
+    }
 
     public override Task ConnectAsync(string host, int port, bool useSsl, CancellationToken cancellationToken)
     {
@@ -169,12 +187,13 @@ public class MultiConnectionNntpClient(
                 LogException(() => connectionLock?.Dispose());
                 if (retryCount > 0)
                 {
-                    Log.Debug(e, "Error getting connection-lock for provider {Provider}. Retrying with a new connection.", providerName);
+                    Log.Debug(e, "[{ProviderName}] Error getting connection-lock. Retrying.", ProviderName);
                     retryCount--;
                     continue;
                 }
 
-                Log.Warning(e, "Error getting connection-lock for provider {Provider}.", providerName);
+                Log.Warning("[{ProviderName}] Error getting connection-lock: {ErrorMessage}", ProviderName, e.Message);
+                Log.Debug(e, "[{ProviderName}] Connection-lock error details.", ProviderName);
                 LogException(() => onConnectionReadyAgain?.Invoke(ArticleBodyResult.NotRetrieved));
                 throw;
             }
@@ -201,14 +220,18 @@ public class MultiConnectionNntpClient(
                 circuitBreaker.RecordFailure();
                 LogException(() => connectionLock?.Replace());
                 LogException(() => connectionLock?.Dispose());
+                if (e is TimeoutException || e.Message.Contains("Timeout"))
+                    IncrementTimeoutCount(ProviderName);
+
                 if (retryCount > 0)
                 {
-                    Log.Debug(e, "Error executing nntp {Command} command for provider {Provider}. Retrying with a new connection.", name, providerName);
+                    Log.Debug(e, "[{ProviderName}] Error executing NNTP {Command} command. Retrying.", ProviderName, name);
                     retryCount--;
                     continue;
                 }
 
-                Log.Warning(e, "Error executing nntp {Command} command for provider {Provider}.", name, providerName);
+                Log.Warning("[{ProviderName}] NNTP {Command} failed: {ErrorType}: {ErrorMessage}", ProviderName, name, e.GetType().Name, e.Message);
+                Log.Debug(e, "[{ProviderName}] NNTP {Command} error details.", ProviderName, name);
                 LogException(() => onConnectionReadyAgain?.Invoke(ArticleBodyResult.NotRetrieved));
                 throw;
             }
@@ -257,6 +280,7 @@ public class MultiConnectionNntpClient(
 
     public override void Dispose()
     {
+        TimeoutCounts.TryRemove(ProviderName, out _);
         connectionPool.Dispose();
         GC.SuppressFinalize(this);
     }
