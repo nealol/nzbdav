@@ -1,5 +1,7 @@
 # Changelog
 
+## 0.6.5 - reliability
+
 ## [0.6.4](https://github.com/nzbdav-dev/nzbdav/compare/v0.6.3...v0.6.4) (2026-04-08)
 
 
